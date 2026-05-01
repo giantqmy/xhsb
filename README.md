@@ -406,6 +406,33 @@ python -m web.app
 - ✏️ 编辑船只描述
 - 🗑️ 删除船只
 - 📦 批量 JSON 导入
+- 📷 **上传图片自动识别**（VLM 识别弦号+描述，可编辑确认后入库）
+
+### 📷 图片上传识别
+
+通过 Web 界面上传船只图片，调用视觉模型自动识别弦号和描述，确认后写入数据库。
+
+**流程：**
+
+```
+上传图片 → 🔍 识别（VLM） → 弦号+描述回填到可编辑表单 → 用户确认/修改 → ✅ 确认添加
+```
+
+**使用方式：**
+
+1. 启动 Web 服务：`python -m web`
+2. 打开 `http://localhost:8000`
+3. 点击工具栏 **📷 上传图片识别** 按钮
+4. 拖拽或点击上传船只图片（支持 JPG/PNG/BMP/WebP，最大 20MB）
+5. 点击 **🔍 识别**，等待 VLM 返回结果
+6. 检查/修改弦号和描述（均可编辑）
+7. 点击 **✅ 确认添加** 写入数据库
+
+**注意事项：**
+- 需要 VLM 服务运行中（vLLM 部署的 Qwen3.5），`config.yaml` 中 `llm.base_url` 指向 VLM 地址
+- VLM 和 Web 服务可以在不同机器上，只要网络可达、`base_url` 配置正确即可
+- 识别 prompt 与 Pipeline 保持一致：不评价图片质量，强制尝试读取可见文字
+- 弦号已存在时会提示覆盖，确认后更新描述
 
 ### REST API
 
@@ -417,6 +444,8 @@ python -m web.app
 | `PUT` | `/api/ships/{hull_number}` | 更新船只描述 |
 | `DELETE` | `/api/ships/{hull_number}` | 删除船只 |
 | `POST` | `/api/ships/bulk` | 批量导入 |
+| `POST` | `/api/ships/recognize` | 上传图片识别（返回弦号+描述，不写入数据库） |
+| `POST` | `/api/ships/recognize-and-add` | 上传图片识别并自动入库 |
 | `GET` | `/api/search?q=关键词` | 按描述搜索 |
 | `GET` | `/api/stats` | 数据库统计 |
 
