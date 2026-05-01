@@ -134,9 +134,6 @@
   }
   .recognize-result.show { display: block; }
   .recognize-result .label { font-size: 12px; color: var(--text-secondary); margin-bottom: 4px; }
-  .recognize-result .value { font-size: 14px; margin-bottom: 12px; }
-  .recognize-result .value:last-child { margin-bottom: 0; }
-  .recognize-result .hull { font-weight: 600; color: var(--primary); font-size: 16px; }
   .recognize-result .exists-warn { color: var(--danger); font-size: 13px; margin-top: 4px; }
 
   /* 加载动画 */
@@ -236,18 +233,18 @@
     </div>
 
     <div class="recognize-result" id="recognizeResult">
-      <div class="label">识别到弦号</div>
-      <div class="value hull" id="recHullNumber">-</div>
-      <div class="label">船只描述</div>
-      <div class="value" id="recDescription">-</div>
+      <div class="label">识别到弦号（可修改）</div>
+      <input type="text" id="recHullNumber" placeholder="弦号" style="width:100%;padding:8px 10px;border:1px solid var(--border);border-radius:6px;font-size:14px;margin-bottom:12px;font-weight:600;color:var(--primary)" />
+      <div class="label">船只描述（可修改）</div>
+      <textarea id="recDescription" rows="3" placeholder="船只描述" style="width:100%;padding:8px 10px;border:1px solid var(--border);border-radius:6px;font-size:14px;margin-bottom:12px;resize:vertical;font-family:inherit"></textarea>
       <div class="exists-warn" id="recExistsWarn" style="display:none">⚠️ 该弦号已存在于数据库中，确认后将覆盖原有描述</div>
     </div>
 
     <div class="modal-actions">
       <button class="btn btn-outline" onclick="closeUploadModal()">取消</button>
       <button class="btn btn-outline" id="btnRecognize" onclick="doRecognize()">🔍 识别</button>
-      <button class="btn btn-primary" id="btnRecognizeAndAdd" onclick="doRecognizeAndAdd()" style="display:none">
-        ✅ 识别并添加
+      <button class="btn btn-primary" id="btnConfirmAdd" onclick="doConfirmAdd()" style="display:none">
+        ✅ 确认添加
       </button>
     </div>
   </div>
@@ -434,9 +431,9 @@ function openUploadModal() {
   document.getElementById('uploadPreview').src = '';
   document.getElementById('recognizeResult').classList.remove('show');
   document.getElementById('btnRecognize').style.display = '';
-  document.getElementById('btnRecognizeAndAdd').style.display = 'none';
+  document.getElementById('btnConfirmAdd').style.display = 'none';
   document.getElementById('btnRecognize').disabled = false;
-  document.getElementById('btnRecognizeAndAdd').disabled = false;
+  document.getElementById('btnConfirmAdd').disabled = false;
   document.getElementById('uploadModal').classList.add('active');
 }
 
@@ -490,7 +487,7 @@ function handleUploadFile(file) {
   // 重置识别结果
   document.getElementById('recognizeResult').classList.remove('show');
   document.getElementById('btnRecognize').style.display = '';
-  document.getElementById('btnRecognizeAndAdd').style.display = 'none';
+  document.getElementById('btnConfirmAdd').style.display = 'none';
 }
 
 async function doRecognize() {
@@ -513,8 +510,8 @@ async function doRecognize() {
     if (!resp.ok) throw new Error(data.detail || '识别失败');
 
     const d = data.data;
-    document.getElementById('recHullNumber').textContent = d.hull_number || '(未识别到)';
-    document.getElementById('recDescription').textContent = d.description || '-';
+    document.getElementById('recHullNumber').value = d.hull_number || '';
+    document.getElementById('recDescription').value = d.description || '';
 
     const warn = document.getElementById('recExistsWarn');
     if (d.already_exists) {
@@ -525,7 +522,7 @@ async function doRecognize() {
     }
 
     document.getElementById('recognizeResult').classList.add('show');
-    document.getElementById('btnRecognizeAndAdd').style.display = '';
+    document.getElementById('btnConfirmAdd').style.display = '';
   } catch (e) {
     showToast('识别失败: ' + e.message, 'error');
   } finally {
@@ -534,28 +531,27 @@ async function doRecognize() {
   }
 }
 
-async function doRecognizeAndAdd() {
-  if (!uploadFile) { showToast('请先选择图片', 'error'); return; }
+async function doConfirmAdd() {
+  const hn = document.getElementById('recHullNumber').value.trim();
+  const desc = document.getElementById('recDescription').value.trim();
+  if (!hn) { showToast('弦号不能为空', 'error'); return; }
+  if (!desc) { showToast('描述不能为空', 'error'); return; }
 
-  const btn = document.getElementById('btnRecognizeAndAdd');
+  const btn = document.getElementById('btnConfirmAdd');
   const origText = btn.innerHTML;
   btn.disabled = true;
-  btn.innerHTML = '<span class="loading-spinner"></span> 处理中…';
+  btn.innerHTML = '<span class="loading-spinner"></span> 提交中…';
 
   try {
-    const formData = new FormData();
-    formData.append('file', uploadFile);
-
-    const resp = await fetch(`${API}/ships/recognize-and-add`, {
+    const resp = await fetch(`${API}/ships`, {
       method: 'POST',
-      body: formData,
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({hull_number: hn, description: desc}),
     });
     const data = await resp.json();
-    if (!resp.ok) throw new Error(data.detail || '处理失败');
+    if (!resp.ok) throw new Error(data.detail || '添加失败');
 
-    const d = data.data;
-    const action = d.action === 'updated' ? '已更新' : '已添加';
-    showToast(`✅ ${action}：弦号 ${d.hull_number}`);
+    showToast(`✅ 已添加：弦号 ${hn}`);
     closeUploadModal();
     loadShips();
   } catch (e) {
