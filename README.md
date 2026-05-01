@@ -18,7 +18,7 @@
 | 阈值过滤 | 语义检索结果低于置信度阈值自动过滤 |
 | Few-shot 引导 | 内置示例对话，确保 Agent 严格遵循识别流程 |
 | 向量库持久化 | FAISS 索引首次构建后缓存磁盘，后续直接加载 |
-| 自动变更检测 | MD5 哈希比对 CSV，数据变更自动重建向量库 |
+| 自动变更检测 | MD5 哈希比对数据源，数据变更自动重建向量库 |
 | 批量建库 | 视觉模型自动识别图片生成弦号+描述，支持查重和原子写入 |
 
 ### Pipeline 视频处理
@@ -36,6 +36,16 @@
 | 多源输入 | 视频文件（MP4/AVI/MKV）、USB 相机、RTSP/HTTP 视频流 |
 | Demo 可视化 | 实时显示检测框、跟踪 ID、识别结果、FPS HUD |
 
+### 数据库管理
+
+| 功能 | 说明 |
+|------|------|
+| **可插拔数据源** | 支持 CSV 和 SQLite 两种后端，通过配置切换 |
+| **Web 管理界面** | FastAPI + 前端页面，浏览器中管理船只数据 |
+| **REST API** | 完整 CRUD 接口，支持批量导入和关键词搜索 |
+| **数据迁移** | CSV → SQLite 一键迁移工具 |
+| **向后兼容** | 默认 CSV 后端，原有功能零改动 |
+
 ---
 
 ## 🏗️ 项目结构
@@ -43,10 +53,23 @@
 ```
 ship-hull-agent/
 ├── config.py                # 配置读取：config.yaml + 内置默认值
-├── config.yaml              # 全局配置文件（LLM / Embedding / Pipeline）
+├── config.yaml              # 全局配置文件（LLM / Embedding / Database / Pipeline）
 ├── build_db.py              # 批量建库脚本（图片 → 弦号+描述 → CSV）
+├── migrate_csv_to_sqlite.py # CSV → SQLite 数据迁移工具
 │
-├── database/__init__.py     # ShipDatabase：CSV 数据源 + FAISS 向量库 + 自动变更检测
+├── database/                # 📦 可插拔数据源模块
+│   ├── __init__.py          # ShipDatabase：统一接口 + FAISS 向量库
+│   ├── base.py              # ShipDataSource 抽象基类
+│   ├── csv_source.py        # CSV 后端（默认，向后兼容）
+│   └── sql_source.py        # SQLite 后端（支持 Web CRUD）
+│
+├── web/                     # 🌐 Web 管理服务
+│   ├── __init__.py
+│   ├── __main__.py          # python -m web 启动入口
+│   ├── app.py               # FastAPI 应用（REST API + 页面路由）
+│   └── static/
+│       └── index.html       # 前端管理页面
+│
 ├── tools/__init__.py        # LangChain @tool：lookup_by_hull_number / retrieve_by_description
 ├── agent/__init__.py        # ShipHullAgent：ReAct Agent + Few-shot 示例
 ├── cli/                     # Rich CLI：单次查询 / 交互 REPL / --verbose 调用链
@@ -62,7 +85,8 @@ ship-hull-agent/
 │   ├── video_input.py       # 视频/相机/视频流统一输入
 │   └── demo.py              # Demo 可视化渲染（检测框 + HUD）
 │
-├── data/ships.csv           # 船只数据库
+├── data/ships.csv           # 船只数据库（CSV 后端）
+├── data/ships.db            # 船只数据库（SQLite 后端，切换后自动创建）
 ├── tests/                   # 单元测试 + 并发压力测试
 ├── .env.example             # 环境变量模板
 └── pyproject.toml           # 项目元数据 + 依赖声明
@@ -75,8 +99,8 @@ ship-hull-agent/
 ### 1. 克隆项目
 
 ```bash
-git clone https://github.com/hyshhh/projectv3.git
-cd projectv3
+git clone https://github.com/giantqmy/xhsb.git
+cd xhsb
 ```
 
 ### 2. 启动视觉模型服务
@@ -135,12 +159,16 @@ embed:
   model: "text-embedding-v4"
   api_key: "your-embed-api-key"
   base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
-  # dimensions: 1024  # 部分模型需要，Qwen3-Embedding-0.6B 不需要则注释掉
 
 # RAG 检索
 retrieval:
   top_k: 3
   score_threshold: 0.5
+
+# 数据库后端（csv 或 sqlite）
+database:
+  backend: "csv"
+  sqlite_path: "./data/ships.db"
 ```
 
 ### 5. 运行
@@ -298,6 +326,131 @@ $ python3 build_db.py ./my_ship_photos
 | 无弦号，用文件名作 fallback | 自动加后缀 `_2`、`_3` 避免覆盖 |
 
 > 每张图片识别后**立即写入 CSV**，`Ctrl+C` 不丢数据。
+
+---
+
+## 🗄️ 数据库后端
+
+系统支持两种数据后端，通过 `config.yaml` 中 `database.backend` 切换。
+
+### CSV 后端（默认）
+
+原始模式，数据存储在 `data/ships.csv`，完全向后兼容。
+
+```yaml
+database:
+  backend: "csv"
+```
+
+### SQLite 后端
+
+使用 SQLite 数据库，支持完整的 CRUD 操作和 Web 管理界面。
+
+```yaml
+database:
+  backend: "sqlite"
+  sqlite_path: "./data/ships.db"
+```
+
+**优势**：
+- 支持事务写入，数据一致性更好
+- 支持模糊搜索（LIKE 查询）
+- 自动记录创建/更新时间
+- 适合 Web 管理场景
+
+### 数据迁移
+
+将现有 CSV 数据迁移到 SQLite：
+
+```bash
+python migrate_csv_to_sqlite.py --csv ./data/ships.csv --db ./data/ships.db
+```
+
+迁移完成后修改 `config.yaml` 中 `database.backend` 为 `"sqlite"` 即可。
+
+### 后端对比
+
+| | CSV | SQLite |
+|---|---|---|
+| 文件格式 | `.csv` | `.db` |
+| 读写方式 | 全量读写 | 按需查询 |
+| 并发安全 | 原子写入 | WAL 模式 |
+| 模糊搜索 | 内存过滤 | SQL LIKE |
+| 时间戳 | 无 | 自动记录 |
+| Web 支持 | ✅ | ✅（推荐） |
+| 向后兼容 | ✅ 默认 | 需迁移 |
+
+---
+
+## 🌐 Web 管理服务
+
+基于 FastAPI 的 Web 管理界面，支持通过浏览器管理船只舷号数据。
+
+### 启动
+
+```bash
+# 方式一：模块方式
+python -m web
+
+# 方式二：直接运行
+python -m web.app
+```
+
+启动后访问 `http://localhost:8000` 即可使用管理界面。
+
+### 前端功能
+
+- 📋 查看所有船只列表
+- 🔍 按舷号或描述搜索
+- ➕ 新增船只
+- ✏️ 编辑船只描述
+- 🗑️ 删除船只
+- 📦 批量 JSON 导入
+
+### REST API
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| `GET` | `/api/ships` | 获取所有船只列表 |
+| `GET` | `/api/ships/{hull_number}` | 查询单条船只 |
+| `POST` | `/api/ships` | 新增船只 |
+| `PUT` | `/api/ships/{hull_number}` | 更新船只描述 |
+| `DELETE` | `/api/ships/{hull_number}` | 删除船只 |
+| `POST` | `/api/ships/bulk` | 批量导入 |
+| `GET` | `/api/search?q=关键词` | 按描述搜索 |
+| `GET` | `/api/stats` | 数据库统计 |
+
+### API 示例
+
+```bash
+# 查看所有船只
+curl http://localhost:8000/api/ships
+
+# 新增船只
+curl -X POST http://localhost:8000/api/ships \
+  -H "Content-Type: application/json" \
+  -d '{"hull_number": "A001", "description": "你的自定义船只描述"}'
+
+# 批量导入
+curl -X POST http://localhost:8000/api/ships/bulk \
+  -H "Content-Type: application/json" \
+  -d '{"ships": {"A002": "第二艘船", "A003": "第三艘船"}}'
+
+# 搜索
+curl "http://localhost:8000/api/search?q=白色"
+
+# 删除
+curl -X DELETE http://localhost:8000/api/ships/A001
+```
+
+### 配置
+
+```yaml
+# config.yaml
+web:
+  host: "0.0.0.0"    # 监听地址
+  port: 8000          # 监听端口
+```
 
 ---
 
@@ -543,49 +696,47 @@ for entry in trace[-5:]:
 ```yaml
 # ── 对话模型 ──
 llm:
-  model: "Qwen/Qwen3-VL-4B-AWQ"     # 模型名称
-  api_key: "abc123"                   # API 密钥
-  base_url: "http://localhost:7890/v1" # 服务地址
-  temperature: 0.0                    # 生成温度（0=确定性最高）
+  model: "Qwen/Qwen3-VL-4B-AWQ"
+  api_key: "abc123"
+  base_url: "http://localhost:7890/v1"
+  temperature: 0.0
 
 # ── Embedding 模型 ──
 embed:
   model: "text-embedding-v4"
   api_key: "your-embed-api-key"
   base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
-  # dimensions: 1024  # 部分模型需要，不需要则注释掉
 
 # ── RAG 检索 ──
 retrieval:
-  top_k: 3                # 返回条数
-  score_threshold: 0.5    # 相似度阈值
+  top_k: 3
+  score_threshold: 0.5
 
 # ── 向量库 ──
 vector_store:
-  persist_path: "./vector_store"  # 持久化路径
-  auto_rebuild: false             # 每次启动重建
+  persist_path: "./vector_store"
+  auto_rebuild: false
+
+# ── 数据库后端 ──
+database:
+  backend: "csv"               # "csv" 或 "sqlite"
+  sqlite_path: "./data/ships.db"
+
+# ── Web 服务 ──
+web:
+  host: "0.0.0.0"
+  port: 8000
 
 # ── 应用 ──
 app:
   log_level: "INFO"
-  ship_db_path: "./data/ships.csv"  # CSV 数据库路径
+  ship_db_path: "./data/ships.csv"  # 仅 backend=csv 时生效
 
 # ── Pipeline ──
 pipeline:
-  # Agent/硬编码双模式
-  # false = 硬编码模式：直接调用 VLM + 查库 + 语义检索，无 LLM Agent 编排
-  # true  = Agent 模式：通过 LangChain ReAct Agent 链路调用 3 个工具
   use_agent: false
-
-  # 定时刷新开关
-  # true  = 每隔 gap_num 帧对已识别的 track 重新调用 Agent 识别
-  # false = 仅新 track 出现时识别一次（默认，保持原有逻辑）
   enable_refresh: false
-
-  # 刷新间隔帧数（仅 enable_refresh=true 时生效）
   gap_num: 150
-
-  # 级联/并发模式
   concurrent_mode: false
   max_concurrent: 4
   max_queued_frames: 30
@@ -602,16 +753,25 @@ pipeline:
 
 ### 自定义数据库
 
-创建 JSON 文件：
+**方式一：直接编辑 CSV**
 
-```json
-{
-  "0014": "白色大型客轮，上层建筑为蓝色涂装，船尾有直升机停机坪",
-  "A001": "你的自定义船只描述"
-}
+```csv
+hull_number,description
+0014,白色大型客轮，上层建筑为蓝色涂装，船尾有直升机停机坪
+A001,你的自定义船只描述
 ```
 
-设置 `SHIP_DB_PATH=./data/ships.json`，`VECTOR_STORE_AUTO_BUILD=true` 重建索引。
+**方式二：使用 Web 界面**
+
+启动 Web 服务后在浏览器中添加。
+
+**方式三：调用 API**
+
+```bash
+curl -X POST http://localhost:8000/api/ships \
+  -H "Content-Type: application/json" \
+  -d '{"hull_number": "A001", "description": "你的自定义船只描述"}'
+```
 
 ---
 
@@ -652,7 +812,6 @@ embed:
   model: "Qwen3-Embedding-0.6B"
   api_key: "abc123"
   base_url: "http://localhost:7891/v1"
-  # dimensions 不需要设置（该模型不支持此参数）
 ```
 
 ### 验证
@@ -702,6 +861,8 @@ pytest tests/test_pipeline.py -v
 | 目标检测 | ultralytics YOLO | 船只检测 |
 | 跟踪 | ByteTrack (YOLO 内置) | 多目标跟踪 |
 | 视频处理 | OpenCV (cv2) | 视频读写、图像处理 |
+| 数据库 | SQLite / CSV | 船只数据存储 |
+| Web 框架 | FastAPI + Uvicorn | REST API 管理服务 |
 | 并发 | threading + queue.Queue | 级联/并发双模式 |
 | HTTP | httpx | API 调用 |
 | CLI | Rich | 终端美化输出 |
@@ -734,6 +895,20 @@ VECTOR_STORE_AUTO_REBUILD=true ship-hull "触发重建"
 
 # 方式二：删除缓存目录
 rm -rf ./vector_store  # 下次启动自动重建
+```
+
+### 切换数据后端
+
+```bash
+# 1. 迁移数据（可选）
+python migrate_csv_to_sqlite.py
+
+# 2. 修改 config.yaml
+# database:
+#   backend: "sqlite"
+
+# 3. 启动 Web 管理
+python -m web
 ```
 
 ---
