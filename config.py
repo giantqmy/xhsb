@@ -34,6 +34,10 @@ _DEFAULTS: dict[str, Any] = {
         "persist_path": "./vector_store",
         "auto_rebuild": False,
     },
+    "database": {
+        "backend": "csv",
+        "sqlite_path": "./data/ships.db",
+    },
     "pipeline": {
         "concurrent_mode": False,
         "max_concurrent": 4,
@@ -64,6 +68,10 @@ _DEFAULTS: dict[str, Any] = {
     "app": {
         "log_level": "INFO",
         "ship_db_path": "./data/ships.csv",
+    },
+    "web": {
+        "host": "0.0.0.0",
+        "port": 8000,
     },
 }
 
