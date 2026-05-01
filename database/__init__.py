@@ -1,8 +1,12 @@
-"""船弦号数据库 — CSV 数据源 + FAISS 向量库 + 自动变更检测"""
+"""船弦号数据库 — 可插拔数据源 + FAISS 向量库 + 自动变更检测
+
+支持两种数据后端（通过 config.yaml 中 database.backend 切换）：
+  - csv   : 原始 CSV 文件（默认，完全向后兼容）
+  - sqlite: SQLite 数据库（支持 Web CRUD）
+"""
 
 from __future__ import annotations
 
-import csv
 import hashlib
 import logging
 from pathlib import Path
@@ -15,20 +19,6 @@ from langchain_core.embeddings import Embeddings
 from config import load_config
 
 logger = logging.getLogger(__name__)
-
-# ── 内置默认 CSV 内容 ──────────────────────────
-
-DEFAULT_CSV_CONTENT = """hull_number,description
-0014,白色大型客轮，上层建筑为蓝色涂装，船尾有直升机停机坪
-0025,黑色散货船，船体有红色水线，甲板上配有龙门吊
-0123,白色邮轮，船身有红蓝条纹装饰，三座烟囱
-0256,灰色军舰，隐身外形设计，舰首配有垂直发射系统
-0389,红色渔船，船身有白色编号，甲板配有拖网绞车
-0455,绿色集装箱船，船体涂有大型LOGO，配有四台岸桥吊
-0512,黄色挖泥船，船体宽大，中部有大型绞吸臂
-0678,蓝色油轮，双壳结构，船尾有大型舵机舱
-0789,白色科考船，船尾有A型吊架，甲板有多个实验室舱
-"""
 
 HASH_FILE_NAME = ".db_hash"
 
@@ -55,7 +45,7 @@ class DashScopeEmbeddings(Embeddings):
         import time
 
         max_retries = 3
-        batch_size = 10  # DashScope text-embedding-v4 单次上限
+        batch_size = 10
         all_embeddings: list[list[float]] = []
 
         for batch_start in range(0, len(texts), batch_size):
@@ -108,14 +98,32 @@ class DashScopeEmbeddings(Embeddings):
         return self.embed_documents([text])[0]
 
 
+def _create_source(config: dict[str, Any], db_path: str | None = None):
+    """根据配置创建对应的数据源实例"""
+    from .csv_source import CsvShipSource
+    from .sql_source import SqlShipSource
+
+    db_cfg = config.get("database", {})
+    backend = db_cfg.get("backend", "csv")
+
+    if backend == "sqlite":
+        sql_path = db_path or db_cfg.get("sqlite_path", "./data/ships.db")
+        logger.info("使用 SQLite 数据源: %s", sql_path)
+        return SqlShipSource(sql_path)
+    else:
+        csv_path = db_path or config.get("app", {}).get("ship_db_path", "./data/ships.csv")
+        logger.info("使用 CSV 数据源: %s", csv_path)
+        return CsvShipSource(csv_path)
+
+
 class ShipDatabase:
     """
     船弦号数据库 — 双通道检索：
       1. 精确查找（dict，O(1)）
       2. FAISS 向量语义检索（RAG）
 
-    数据源：CSV 文件（hull_number, description）
-    自动变更检测：通过 MD5 哈希比对，CSV 变更时自动重建向量库。
+    数据源：可插拔（CSV / SQLite）
+    自动变更检测：通过 MD5 哈希比对，数据变更时自动重建向量库。
     """
 
     def __init__(
@@ -132,12 +140,11 @@ class ShipDatabase:
         retrieval_cfg = config.get("retrieval", {})
         vs_cfg = config.get("vector_store", {})
 
-        # ── 确定 CSV 路径 ──
-        csv_path = db_path or config.get("app", {}).get("ship_db_path")
-        self._csv_path = self._resolve_csv_path(csv_path)
+        # ── 创建数据源 ──
+        self._source = _create_source(config, db_path)
 
-        # ── 加载数据 ──
-        self._data = self._load_csv(self._csv_path)
+        # ── 加载数据到内存缓存 ──
+        self._data = self._source.load_all()
 
         # ── Embedding 客户端 ──
         self._embeddings = DashScopeEmbeddings(
@@ -157,50 +164,12 @@ class ShipDatabase:
         # ── 向量库（懒加载） ──
         self._vector_store: FAISS | None = None
 
-    # ── CSV 路径解析 ────────────────────────────
+    # ── 数据指纹（兼容 CSV 和 SQLite）────────────────────
 
-    def _resolve_csv_path(self, db_path: str | None) -> Path:
-        if db_path:
-            p = Path(db_path)
-            if not p.exists():
-                raise FileNotFoundError(
-                    f"CSV 数据库文件不存在: {p}\n"
-                    f"请检查 config.yaml 中 app.ship_db_path 配置。"
-                )
-        else:
-            p = Path(__file__).resolve().parent.parent / "data" / "ships.csv"
-            if not p.exists():
-                p.parent.mkdir(parents=True, exist_ok=True)
-                p.write_text(DEFAULT_CSV_CONTENT.strip(), encoding="utf-8")
-                logger.info("已创建默认 CSV 数据库: %s", p)
-
-        return p.resolve()
-
-    # ── CSV 加载 ────────────────────────────────
-
-    @staticmethod
-    def _load_csv(path: Path) -> dict[str, str]:
-        data: dict[str, str] = {}
-        with open(path, "r", encoding="utf-8-sig") as f:
-            reader = csv.DictReader(f)
-            if reader.fieldnames is None:
-                logger.error("CSV 文件为空或无法解析表头: %s", path)
-                return data
-            if "hull_number" not in reader.fieldnames:
-                logger.error("CSV 文件缺少 hull_number 列，实际列: %s", reader.fieldnames)
-                return data
-            for row in reader:
-                hn = (row.get("hull_number") or "").strip()
-                desc = (row.get("description") or "").strip()
-                if hn:
-                    data[hn] = desc
-        logger.info("从 CSV 加载了 %d 条船记录: %s", len(data), path)
-        return data
-
-    # ── 变更检测 ────────────────────────────────
-
-    def _compute_csv_hash(self) -> str:
-        return hashlib.md5(self._csv_path.read_bytes()).hexdigest()
+    def _compute_data_hash(self) -> str:
+        """计算当前数据的哈希值，用于变更检测"""
+        content = "\n".join(f"{k}|{v}" for k, v in sorted(self._data.items()))
+        return hashlib.md5(content.encode("utf-8")).hexdigest()
 
     def _load_saved_hash(self) -> str | None:
         hash_file = Path(self._persist_path) / HASH_FILE_NAME
@@ -208,17 +177,17 @@ class ShipDatabase:
             return hash_file.read_text(encoding="utf-8").strip()
         return None
 
-    def _save_hash(self, csv_hash: str) -> None:
+    def _save_hash(self, data_hash: str) -> None:
         persist_dir = Path(self._persist_path)
         persist_dir.mkdir(parents=True, exist_ok=True)
-        (persist_dir / HASH_FILE_NAME).write_text(csv_hash, encoding="utf-8")
+        (persist_dir / HASH_FILE_NAME).write_text(data_hash, encoding="utf-8")
 
-    def _csv_changed(self) -> bool:
-        current_hash = self._compute_csv_hash()
+    def _data_changed(self) -> bool:
+        current_hash = self._compute_data_hash()
         saved_hash = self._load_saved_hash()
         changed = current_hash != saved_hash
         if changed:
-            logger.info("CSV 数据变更检测: 文件已修改，将重建向量库")
+            logger.info("数据变更检测: 数据已修改，将重建向量库")
         return changed
 
     # ── 向量库构建 ─────────────────────────────
@@ -237,9 +206,9 @@ class ShipDatabase:
         persist_dir = Path(self._persist_path)
         index_file = persist_dir / "index.faiss"
 
-        csv_changed = self._csv_changed()
+        data_changed = self._data_changed()
 
-        if not self._auto_rebuild and not csv_changed and index_file.exists():
+        if not self._auto_rebuild and not data_changed and index_file.exists():
             try:
                 logger.info("从 %s 加载向量库缓存…", persist_dir)
                 vs = FAISS.load_local(
@@ -252,10 +221,9 @@ class ShipDatabase:
             except Exception as e:
                 logger.warning("缓存加载失败（%s），将重新构建", e)
 
-        # CSV 变化时，先重新加载数据
-        if csv_changed:
-            logger.info("重新加载 CSV 数据: %s", self._csv_path)
-            self._data = self._load_csv(self._csv_path)
+        # 数据变化时，重新加载
+        if data_changed:
+            self._data = self._source.load_all()
 
         docs = self._build_documents()
         logger.info("正在构建 FAISS 向量库（%d 条文档）…", len(docs))
@@ -264,21 +232,21 @@ class ShipDatabase:
         persist_dir.mkdir(parents=True, exist_ok=True)
         vs.save_local(str(persist_dir))
 
-        self._save_hash(self._compute_csv_hash())
+        self._save_hash(self._compute_data_hash())
         logger.info("向量库已持久化到 %s，哈希已更新", persist_dir)
 
         return vs
 
     @property
     def vector_store(self) -> FAISS:
-        if self._vector_store is None or self._csv_changed():
+        if self._vector_store is None or self._data_changed():
             self._vector_store = self._load_or_build_vector_store()
         return self._vector_store
 
     # ── 精确查找 ──────────────────────────────
 
     def lookup(self, hull_number: str) -> str | None:
-        return self._data.get(hull_number.strip())
+        return self._source.lookup(hull_number)
 
     # ── 语义检索 ──────────────────────────────
 
@@ -300,11 +268,45 @@ class ShipDatabase:
         results = self.semantic_search(query, top_k=self._top_k)
         return [r for r in results if r["score"] >= self._score_threshold]
 
+    # ── CRUD 操作（委托给数据源）─────────────────────
+
+    def add_ship(self, hull_number: str, description: str) -> bool:
+        """新增船只，成功返回 True"""
+        result = self._source.add(hull_number, description)
+        if result:
+            self._invalidate_cache()
+        return result
+
+    def update_ship(self, hull_number: str, description: str) -> bool:
+        """更新船只描述，成功返回 True"""
+        result = self._source.update(hull_number, description)
+        if result:
+            self._invalidate_cache()
+        return result
+
+    def delete_ship(self, hull_number: str) -> bool:
+        """删除船只，成功返回 True"""
+        result = self._source.delete(hull_number)
+        if result:
+            self._invalidate_cache()
+        return result
+
+    def reload(self) -> None:
+        """强制重新加载数据并重建向量库"""
+        self._data = self._source.load_all()
+        self._vector_store = None  # 下次访问时重建
+
+    def _invalidate_cache(self) -> None:
+        """数据变更后使缓存失效"""
+        self._data = self._source.load_all()
+        self._vector_store = None
+
     # ── 属性 ──────────────────────────────────
 
     @property
-    def csv_path(self) -> Path:
-        return self._csv_path
+    def source(self):
+        """获取底层数据源实例（供 Web 层使用）"""
+        return self._source
 
     @property
     def hull_numbers(self) -> list[str]:
