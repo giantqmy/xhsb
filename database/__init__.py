@@ -146,12 +146,9 @@ class ShipDatabase:
         # ── 加载数据到内存缓存 ──
         self._data = self._source.load_all()
 
-        # ── Embedding 客户端 ──
-        self._embeddings = DashScopeEmbeddings(
-            model=embed_cfg.get("model", "Qwen3-Embedding-0.6B"),
-            api_key=embed_cfg.get("api_key", ""),
-            base_url=embed_cfg.get("base_url", "http://localhost:7891/v1"),
-        )
+        # ── Embedding 配置（懒初始化，不影响 CRUD 操作）──
+        self._embed_cfg = embed_cfg
+        self._embeddings: Embeddings | None = None
 
         # ── 检索参数 ──
         self._top_k = retrieval_cfg.get("top_k", 3)
@@ -213,7 +210,7 @@ class ShipDatabase:
                 logger.info("从 %s 加载向量库缓存…", persist_dir)
                 vs = FAISS.load_local(
                     str(persist_dir),
-                    self._embeddings,
+                    self._get_embeddings(),
                     allow_dangerous_deserialization=True,
                 )
                 logger.info("向量库缓存加载成功")
@@ -227,7 +224,7 @@ class ShipDatabase:
 
         docs = self._build_documents()
         logger.info("正在构建 FAISS 向量库（%d 条文档）…", len(docs))
-        vs = FAISS.from_documents(docs, self._embeddings)
+        vs = FAISS.from_documents(docs, self._get_embeddings())
 
         persist_dir.mkdir(parents=True, exist_ok=True)
         vs.save_local(str(persist_dir))
@@ -236,6 +233,16 @@ class ShipDatabase:
         logger.info("向量库已持久化到 %s，哈希已更新", persist_dir)
 
         return vs
+
+    def _get_embeddings(self) -> Embeddings:
+        """懒初始化 Embedding 客户端（首次调用语义检索时才创建）"""
+        if self._embeddings is None:
+            self._embeddings = DashScopeEmbeddings(
+                model=self._embed_cfg.get("model", "Qwen3-Embedding-0.6B"),
+                api_key=self._embed_cfg.get("api_key", ""),
+                base_url=self._embed_cfg.get("base_url", "http://localhost:7891/v1"),
+            )
+        return self._embeddings
 
     @property
     def vector_store(self) -> FAISS:
