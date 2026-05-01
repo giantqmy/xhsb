@@ -77,6 +77,7 @@ class SqlShipSource(ShipDataSource):
         return row["description"] if row else None
 
     def add(self, hull_number: str, description: str) -> bool:
+        """严格新增：已存在返回 False。"""
         hn = hull_number.strip()
         try:
             with self._get_conn() as conn:
@@ -87,6 +88,27 @@ class SqlShipSource(ShipDataSource):
             return True
         except sqlite3.IntegrityError:
             return False
+
+    def upsert(self, hull_number: str, description: str) -> str:
+        """插入或更新：不存在则新增，已存在则覆盖描述。返回 'inserted' 或 'updated'。"""
+        hn = hull_number.strip()
+        with self._get_conn() as conn:
+            existing = conn.execute(
+                "SELECT 1 FROM ships WHERE hull_number = ?", (hn,)
+            ).fetchone()
+            if existing:
+                conn.execute(
+                    "UPDATE ships SET description = ?, updated_at = datetime('now', 'localtime') "
+                    "WHERE hull_number = ?",
+                    (description.strip(), hn),
+                )
+                return "updated"
+            else:
+                conn.execute(
+                    "INSERT INTO ships (hull_number, description) VALUES (?, ?)",
+                    (hn, description.strip()),
+                )
+                return "inserted"
 
     def update(self, hull_number: str, description: str) -> bool:
         hn = hull_number.strip()

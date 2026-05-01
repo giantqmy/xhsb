@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import logging
@@ -37,6 +38,7 @@ logger = logging.getLogger(__name__)
 # ── 全局数据库实例 ──
 _db: ShipDatabase | None = None
 _config: dict | None = None
+_write_lock = asyncio.Lock()  # 保护 recognize_and_add 等 read-modify-write 操作
 
 
 def get_config() -> dict:
@@ -311,12 +313,12 @@ async def recognize_and_add_ship(file: UploadFile = File(...)):
     if not hull_number:
         raise HTTPException(status_code=400, detail="未能识别出弦号，请手动输入")
 
-    db = get_db()
-    existing_desc = db.lookup(hull_number)
+    # 加锁：保证 lookup→upsert 原子性，防止并发重复写入
+    async with _write_lock:
+        db = get_db()
+        action = db.upsert_ship(hull_number, description)
 
-    if existing_desc is not None:
-        # 弦号已存在，更新描述
-        db.update_ship(hull_number, description)
+    if action == "updated":
         return ApiResponse(
             success=True,
             message=f"弦号 {hull_number} 已存在，已更新描述",
@@ -327,8 +329,6 @@ async def recognize_and_add_ship(file: UploadFile = File(...)):
             },
         )
     else:
-        # 新弦号，直接添加
-        db.add_ship(hull_number, description)
         return ApiResponse(
             success=True,
             message=f"成功添加弦号: {hull_number}",

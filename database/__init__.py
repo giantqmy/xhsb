@@ -298,6 +298,12 @@ class ShipDatabase:
             self._invalidate_cache()
         return result
 
+    def upsert_ship(self, hull_number: str, description: str) -> str:
+        """插入或更新船只。返回 'inserted' 或 'updated'。"""
+        result = self._source.upsert(hull_number, description)
+        self._invalidate_cache()
+        return result
+
     def reload(self) -> None:
         """强制重新加载数据并重建向量库"""
         self._data = self._source.load_all()

@@ -119,6 +119,18 @@ class CsvShipSource(ShipDataSource):
             self._save()
         return added
 
+    def upsert(self, hull_number: str, description: str) -> str:
+        """插入或更新，返回 'inserted' 或 'updated'。"""
+        hn = hull_number.strip()
+        if hn in self._data:
+            self._data[hn] = description.strip()
+            self._save()
+            return "updated"
+        else:
+            self._data[hn] = description.strip()
+            self._save()
+            return "inserted"
+
     def items(self):
         return self._data
 

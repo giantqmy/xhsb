@@ -41,6 +41,16 @@ class ShipDataSource(ABC):
     def bulk_add(self, records: dict[str, str]) -> int:
         """批量添加，返回成功添加的数量（跳过已存在的）"""
 
+    def upsert(self, hull_number: str, description: str) -> str:
+        """插入或更新：不存在则新增，已存在则覆盖。返回 'inserted' 或 'updated'。"""
+        hn = hull_number.strip()
+        if hn in self.load_all():
+            self.update(hn, description)
+            return "updated"
+        else:
+            self.add(hn, description)
+            return "inserted"
+
     def items(self) -> Mapping[str, str]:
         """返回只读映射（默认实现，子类可覆盖）"""
         return self.load_all()
