@@ -1,5 +1,5 @@
 """
-自动构建数据库脚本 — 扫描图片目录，调用视觉模型识别船只，自动生成弦号和描述并存入 CSV。
+自动构建数据库脚本 — 扫描图片目录，调用视觉模型识别船只，自动生成弦号和描述并存入数据库。
 
 用法：
     python3 build_db.py <图片目录路径>
@@ -12,13 +12,14 @@
     5. 询问用户确认弦号是否正确
        - 按 1：确认 / 跳过
        - 按 2：覆盖 / 手动输入
-    6. 立即写入 CSV，继续下一张
+    6. 立即写入数据库，继续下一张
+
+支持 CSV 和 SQLite 后端（通过 config.yaml 中 database.backend 切换）。
 """
 
 from __future__ import annotations
 
 import base64
-import csv
 import json
 import logging
 import re
@@ -31,6 +32,7 @@ from rich.console import Console
 from rich.prompt import Prompt
 
 from config import load_config
+from database import ShipDatabase
 
 logger = logging.getLogger(__name__)
 console = Console()
@@ -111,20 +113,6 @@ def recognize_ship(image_path: Path, llm: ChatOpenAI) -> dict:
     }
 
 
-def load_existing_csv(csv_path: Path) -> dict[str, str]:
-    """加载已有 CSV 数据，返回 {hull_number: description}。"""
-    data: dict[str, str] = {}
-    if csv_path.exists():
-        with open(csv_path, "r", encoding="utf-8-sig") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                hn = row.get("hull_number", "").strip()
-                desc = row.get("description", "").strip()
-                if hn:
-                    data[hn] = desc
-    return data
-
-
 def confirm_hull_number(detected: str) -> str:
     """
     询问用户确认弦号。
@@ -185,7 +173,6 @@ def main() -> None:
     llm_cfg = config.get("llm", {})
     model = llm_cfg.get("model", "Qwen/Qwen3-VL-4B-AWQ")
     base_url = llm_cfg.get("base_url", "http://localhost:7890/v1")
-    csv_path = Path(config.get("app", {}).get("ship_db_path") or "data/ships.csv")
 
     # 视觉模型客户端
     llm = ChatOpenAI(
@@ -196,12 +183,10 @@ def main() -> None:
         max_tokens=1024,
     )
 
-    # 确保 CSV 目录存在
-    csv_path.parent.mkdir(parents=True, exist_ok=True)
-
-    # 加载已有数据
-    existing = load_existing_csv(csv_path)
-    console.print(f"\n📦 已有数据库: {csv_path}（{len(existing)} 条记录）")
+    # 初始化数据库（通过 ShipDatabase 抽象层，自动适配 CSV/SQLite）
+    db = ShipDatabase(config=config)
+    backend = config.get("database", {}).get("backend", "csv")
+    console.print(f"\n📦 数据库后端: {backend}（{db.source.count()} 条记录）")
 
     # 扫描图片
     images = scan_images(image_dir)
@@ -238,9 +223,10 @@ def main() -> None:
         console.print(f"     描述: {description}")
 
         # 2. 检查弦号是否已存在
-        if hull_number and hull_number in existing:
+        if hull_number and db.source.exists(hull_number):
+            existing_desc = db.source.lookup(hull_number) or ""
             console.print(f"\n  ⚠️  弦号 [{hull_number}] 已存在于数据库中")
-            console.print(f"     现有描述: {existing[hull_number]}")
+            console.print(f"     现有描述: {existing_desc}")
             console.print("  按 [bold green]1[/bold green] 跳过（保留原记录）")
             console.print("  按 [bold yellow]2[/bold yellow] 覆盖为新描述")
             console.print("  按 [bold red]3[/bold red] 手动输入新弦号")
@@ -257,16 +243,16 @@ def main() -> None:
                     skip_count += 1
                     break
                 elif choice == "2":
-                    existing[hull_number] = description
-                    _rewrite_csv(csv_path, existing)
+                    db.upsert_ship(hull_number, description)
                     console.print(f"  ✅ 已覆盖弦号 [{hull_number}]")
                     success_count += 1
                     break
                 elif choice == "3":
                     hull_number = confirm_hull_number("")
-                    if hull_number and hull_number in existing:
+                    if hull_number and db.source.exists(hull_number):
                         console.print(f"\n  ⚠️  手动弦号 [{hull_number}] 也已存在")
-                        console.print(f"     现有描述: {existing[hull_number]}")
+                        existing_desc = db.source.lookup(hull_number) or ""
+                        console.print(f"     现有描述: {existing_desc}")
                         console.print("  按 [bold green]1[/bold green] 跳过（保留原记录）")
                         console.print("  按 [bold yellow]2[/bold yellow] 覆盖为新描述")
                         try:
@@ -280,14 +266,12 @@ def main() -> None:
                             skip_count += 1
                             break
                         else:
-                            existing[hull_number] = description
-                            _rewrite_csv(csv_path, existing)
+                            db.upsert_ship(hull_number, description)
                             console.print(f"  ✅ 已覆盖弦号 [{hull_number}]")
                             success_count += 1
                             break
                     elif hull_number:
-                        existing[hull_number] = description
-                        _rewrite_csv(csv_path, existing)
+                        db.upsert_ship(hull_number, description)
                         console.print(f"  ✅ 已保存弦号 [{hull_number}]")
                         success_count += 1
                         break
@@ -301,9 +285,10 @@ def main() -> None:
 
             if hull_number:
                 # 检查手动输入的弦号是否也已存在
-                if hull_number in existing:
+                if db.source.exists(hull_number):
+                    existing_desc = db.source.lookup(hull_number) or ""
                     console.print(f"\n  ⚠️  弦号 [{hull_number}] 已存在")
-                    console.print(f"     现有描述: {existing[hull_number]}")
+                    console.print(f"     现有描述: {existing_desc}")
                     console.print("  按 [bold green]1[/bold green] 跳过（保留原记录）")
                     console.print("  按 [bold yellow]2[/bold yellow] 覆盖为新描述")
                     try:
@@ -316,28 +301,25 @@ def main() -> None:
                         console.print("  ⏭️  已跳过")
                         skip_count += 1
                     else:
-                        existing[hull_number] = description
-                        _rewrite_csv(csv_path, existing)
+                        db.upsert_ship(hull_number, description)
                         console.print(f"  ✅ 已覆盖弦号 [{hull_number}]")
                         success_count += 1
                 else:
-                    existing[hull_number] = description
-                    _rewrite_csv(csv_path, existing)
+                    db.add_ship(hull_number, description)
                     console.print(f"  ✅ 已保存弦号 [{hull_number}]")
                     success_count += 1
             else:
                 # 无弦号，仅保存描述（用图片名作为键）
                 fallback_key = image_path.stem
-                if fallback_key in existing:
+                if db.source.exists(fallback_key):
                     # 生成唯一 key: 文件名 + 序号
                     i = 2
-                    while f"{fallback_key}_{i}" in existing:
+                    while db.source.exists(f"{fallback_key}_{i}"):
                         i += 1
                     fallback_key = f"{fallback_key}_{i}"
                     console.print(f"\n  ⚠️  文件名已用作弦号，自动改为 [{fallback_key}]")
 
-                existing[fallback_key] = description
-                _rewrite_csv(csv_path, existing)
+                db.upsert_ship(fallback_key, description)
                 console.print(f"  ✅ 已保存（使用 [{fallback_key}] 作为弦号）")
                 success_count += 1
 
@@ -349,29 +331,8 @@ def main() -> None:
     console.print(f"   总计: {len(images)} 张图片")
     console.print(f"   成功: {success_count} 条")
     console.print(f"   跳过: {skip_count} 条")
-    console.print(f"   数据库: {csv_path}（共 {len(existing)} 条记录）")
+    console.print(f"   数据库: {backend} 后端（共 {db.source.count()} 条记录）")
     console.print(f"{'='*60}")
-
-
-def _rewrite_csv(csv_path: Path, data: dict[str, str]) -> bool:
-    """原子写入 CSV 文件（先写临时文件再重命名，防止写入中断导致数据丢失）。
-    返回 True 成功，False 失败。"""
-    tmp_path = csv_path.with_suffix(".csv.tmp")
-    try:
-        with open(tmp_path, "w", encoding="utf-8", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(["hull_number", "description"])
-            for hn, desc in data.items():
-                writer.writerow([hn, desc])
-    except Exception as e:
-        if tmp_path.exists():
-            tmp_path.unlink()
-        console.print(f"  [red]⚠️  写入 CSV 失败: {e}[/red]")
-        console.print("  [yellow]数据仍在内存中，下次成功写入时会自动保存[/yellow]")
-        logger.error("写入 CSV 失败: %s", e)
-        return False
-    tmp_path.replace(csv_path)
-    return True
 
 
 if __name__ == "__main__":

@@ -35,7 +35,7 @@ _DEFAULTS: dict[str, Any] = {
         "auto_rebuild": False,
     },
     "database": {
-        "backend": "csv",
+        "backend": "sqlite",
         "sqlite_path": "./data/ships.db",
     },
     "pipeline": {
