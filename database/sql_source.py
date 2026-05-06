@@ -1,7 +1,8 @@
-"""SQLite 数据源后端 — 使用 SQLite 存储船只数据"""
+"""SQLite 数据源后端 — 使用 SQLite 存储船只数据 + embedding 向量"""
 
 from __future__ import annotations
 
+import json
 import logging
 import sqlite3
 from pathlib import Path
@@ -51,6 +52,15 @@ class SqlShipSource(ShipDataSource):
                     updated_at  TEXT DEFAULT (datetime('now', 'localtime'))
                 )
             """)
+            # embedding 向量表
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS ship_embeddings (
+                    hull_number TEXT PRIMARY KEY,
+                    embedding   TEXT NOT NULL,
+                    updated_at  TEXT DEFAULT (datetime('now', 'localtime')),
+                    FOREIGN KEY (hull_number) REFERENCES ships(hull_number) ON DELETE CASCADE
+                )
+            """)
             # 检查是否为空库，空库则导入默认数据
             count = conn.execute("SELECT COUNT(*) FROM ships").fetchone()[0]
             if count == 0:
@@ -60,6 +70,8 @@ class SqlShipSource(ShipDataSource):
                     list(DEFAULT_SHIPS.items()),
                 )
         logger.info("SQLite 数据库就绪: %s", self._db_path)
+
+    # ── CRUD 操作 ──────────────────────────────
 
     def load_all(self) -> dict[str, str]:
         with self._get_conn() as conn:
@@ -77,7 +89,6 @@ class SqlShipSource(ShipDataSource):
         return row["description"] if row else None
 
     def add(self, hull_number: str, description: str) -> bool:
-        """严格新增：已存在返回 False。"""
         hn = hull_number.strip()
         try:
             with self._get_conn() as conn:
@@ -90,7 +101,6 @@ class SqlShipSource(ShipDataSource):
             return False
 
     def upsert(self, hull_number: str, description: str) -> str:
-        """插入或更新：不存在则新增，已存在则覆盖描述。返回 'inserted' 或 'updated'。"""
         hn = hull_number.strip()
         with self._get_conn() as conn:
             existing = conn.execute(
@@ -166,6 +176,88 @@ class SqlShipSource(ShipDataSource):
                 (f"%{keyword}%",),
             ).fetchall()
         return [{"hull_number": row["hull_number"], "description": row["description"]} for row in rows]
+
+    # ── Embedding 向量操作 ──────────────────────
+
+    def store_embedding(self, hull_number: str, vector: list[float]) -> None:
+        """存储一条 embedding 向量（upsert）"""
+        hn = hull_number.strip()
+        vec_json = json.dumps(vector, ensure_ascii=False)
+        with self._get_conn() as conn:
+            conn.execute(
+                "INSERT INTO ship_embeddings (hull_number, embedding, updated_at) "
+                "VALUES (?, ?, datetime('now', 'localtime')) "
+                "ON CONFLICT(hull_number) DO UPDATE SET embedding = excluded.embedding, "
+                "updated_at = excluded.updated_at",
+                (hn, vec_json),
+            )
+
+    def store_embeddings_bulk(self, records: dict[str, list[float]]) -> int:
+        """批量存储 embedding 向量，返回成功数量"""
+        count = 0
+        with self._get_conn() as conn:
+            for hn, vector in records.items():
+                hn = hn.strip()
+                if not hn:
+                    continue
+                vec_json = json.dumps(vector, ensure_ascii=False)
+                conn.execute(
+                    "INSERT INTO ship_embeddings (hull_number, embedding, updated_at) "
+                    "VALUES (?, ?, datetime('now', 'localtime')) "
+                    "ON CONFLICT(hull_number) DO UPDATE SET embedding = excluded.embedding, "
+                    "updated_at = excluded.updated_at",
+                    (hn, vec_json),
+                )
+                count += 1
+        return count
+
+    def load_all_embeddings(self) -> dict[str, list[float]]:
+        """加载全部 embedding，返回 {hull_number: vector}"""
+        with self._get_conn() as conn:
+            rows = conn.execute(
+                "SELECT hull_number, embedding FROM ship_embeddings"
+            ).fetchall()
+        result = {}
+        for row in rows:
+            try:
+                result[row["hull_number"]] = json.loads(row["embedding"])
+            except json.JSONDecodeError:
+                logger.warning("embedding 解析失败: %s", row["hull_number"])
+        return result
+
+    def load_embedding(self, hull_number: str) -> list[float] | None:
+        """加载单条 embedding"""
+        with self._get_conn() as conn:
+            row = conn.execute(
+                "SELECT embedding FROM ship_embeddings WHERE hull_number = ?",
+                (hull_number.strip(),),
+            ).fetchone()
+        if row:
+            try:
+                return json.loads(row["embedding"])
+            except json.JSONDecodeError:
+                return None
+        return None
+
+    def delete_embedding(self, hull_number: str) -> bool:
+        """删除一条 embedding"""
+        with self._get_conn() as conn:
+            cursor = conn.execute(
+                "DELETE FROM ship_embeddings WHERE hull_number = ?",
+                (hull_number.strip(),),
+            )
+        return cursor.rowcount > 0
+
+    def embedding_count(self) -> int:
+        """返回 embedding 记录数"""
+        with self._get_conn() as conn:
+            return conn.execute("SELECT COUNT(*) FROM ship_embeddings").fetchone()[0]
+
+    def clear_embeddings(self) -> int:
+        """清空全部 embedding，返回删除数量"""
+        with self._get_conn() as conn:
+            cursor = conn.execute("DELETE FROM ship_embeddings")
+        return cursor.rowcount
 
     @property
     def db_path(self) -> Path:

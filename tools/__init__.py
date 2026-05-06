@@ -182,7 +182,7 @@ def build_tools(db: ShipDatabase, include_recognize: bool = True) -> list:
         target_description: Annotated[str, "对目标船的外观文字描述，越详细越好"],
     ) -> str:
         """
-        第三步：基于 FAISS 向量库的语义检索。
+        第三步：基于 SQLite embedding 的语义检索。
         当弦号查不到（第二步 found=false），或 recognize_ship 未识别到弦号时调用。
         输入对船只的外观描述，返回最匹配的结果。
         """

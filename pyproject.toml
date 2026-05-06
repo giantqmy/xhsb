@@ -15,7 +15,7 @@ dependencies = [
     "langchain-community>=0.3",
     "langchain-core>=0.3",
     "langchain-openai>=0.3",
-    "faiss-cpu>=1.7",
+
     "openai>=1.0",
     "httpx>=0.25",
     "pyyaml>=6.0",

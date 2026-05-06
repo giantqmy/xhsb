@@ -1,8 +1,10 @@
-"""船弦号数据库 — 可插拔数据源 + FAISS 向量库 + 自动变更检测
+"""船弦号数据库 — 可插拔数据源 + SQLite embedding 向量检索 + 自动变更检测
 
 支持两种数据后端（通过 config.yaml 中 database.backend 切换）：
-  - csv   : 原始 CSV 文件（默认，完全向后兼容）
-  - sqlite: SQLite 数据库（支持 Web CRUD）
+  - csv   : 原始 CSV 文件（完全向后兼容，embedding 存独立 SQLite）
+  - sqlite: SQLite 数据库（embedding 直接存在同一库中）
+
+语义检索：embedding 存储在 SQLite 中，查询时加载到内存计算余弦相似度。
 """
 
 from __future__ import annotations
@@ -12,8 +14,6 @@ import logging
 from pathlib import Path
 from typing import Any, Mapping
 
-from langchain_community.vectorstores import FAISS
-from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 
 from config import load_config
@@ -98,6 +98,17 @@ class DashScopeEmbeddings(Embeddings):
         return self.embed_documents([text])[0]
 
 
+def _cosine_similarity(a: list[float], b: list[float]) -> float:
+    """计算两个向量的余弦相似度"""
+    import math
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = math.sqrt(sum(x * x for x in a))
+    norm_b = math.sqrt(sum(x * x for x in b))
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+
 def _create_source(config: dict[str, Any], db_path: str | None = None):
     """根据配置创建对应的数据源实例"""
     from .csv_source import CsvShipSource
@@ -116,14 +127,34 @@ def _create_source(config: dict[str, Any], db_path: str | None = None):
         return CsvShipSource(csv_path)
 
 
+def _get_embedding_store(config: dict[str, Any], source) -> "SqlShipSource | None":
+    """获取 embedding 存储后端。
+    - SQLite 后端：embedding 直接存在同一库中
+    - CSV 后端：embedding 存在独立的 SQLite 文件中
+    """
+    from .sql_source import SqlShipSource
+
+    db_cfg = config.get("database", {})
+    backend = db_cfg.get("backend", "csv")
+
+    if backend == "sqlite":
+        # embedding 直接用同一个 SqlShipSource
+        return source
+    else:
+        # CSV 后端：用独立的 SQLite 文件存 embedding
+        embed_db_path = db_cfg.get("sqlite_path", "./data/ships.db")
+        logger.info("CSV 后端使用独立 SQLite 存储 embedding: %s", embed_db_path)
+        return SqlShipSource(embed_db_path)
+
+
 class ShipDatabase:
     """
     船弦号数据库 — 双通道检索：
       1. 精确查找（dict，O(1)）
-      2. FAISS 向量语义检索（RAG）
+      2. SQLite embedding 语义检索（余弦相似度）
 
-    数据源：可插拔（CSV / SQLite）
-    自动变更检测：通过 MD5 哈希比对，数据变更时自动重建向量库。
+    embedding 存储在 SQLite 的 ship_embeddings 表中，
+    查询时加载到内存计算余弦相似度。
     """
 
     def __init__(
@@ -138,7 +169,6 @@ class ShipDatabase:
 
         embed_cfg = config.get("embed", {})
         retrieval_cfg = config.get("retrieval", {})
-        vs_cfg = config.get("vector_store", {})
 
         # ── 创建数据源 ──
         self._source = _create_source(config, db_path)
@@ -146,7 +176,10 @@ class ShipDatabase:
         # ── 加载数据到内存缓存 ──
         self._data = self._source.load_all()
 
-        # ── Embedding 配置（懒初始化，不影响 CRUD 操作）──
+        # ── Embedding 存储后端 ──
+        self._embed_store = _get_embedding_store(config, self._source)
+
+        # ── Embedding 配置（懒初始化）──
         self._embed_cfg = embed_cfg
         self._embeddings: Embeddings | None = None
 
@@ -154,14 +187,13 @@ class ShipDatabase:
         self._top_k = retrieval_cfg.get("top_k", 3)
         self._score_threshold = retrieval_cfg.get("score_threshold", 0.5)
 
-        # ── 向量库配置 ──
-        self._persist_path = vs_cfg.get("persist_path", "./vector_store")
-        self._auto_rebuild = vs_cfg.get("auto_rebuild", False)
+        # ── 内存 embedding 缓存 ──
+        self._embedding_cache: dict[str, list[float]] | None = None
 
-        # ── 向量库（懒加载） ──
-        self._vector_store: FAISS | None = None
+        # ── 数据指纹 ──
+        self._persist_path = config.get("vector_store", {}).get("persist_path", "./vector_store")
 
-    # ── 数据指纹（兼容 CSV 和 SQLite）────────────────────
+    # ── 数据指纹（变更检测）─────────────────────
 
     def _compute_data_hash(self) -> str:
         """计算当前数据的哈希值，用于变更检测"""
@@ -184,58 +216,13 @@ class ShipDatabase:
         saved_hash = self._load_saved_hash()
         changed = current_hash != saved_hash
         if changed:
-            logger.info("数据变更检测: 数据已修改，将重建向量库")
+            logger.info("数据变更检测: 数据已修改")
         return changed
 
-    # ── 向量库构建 ─────────────────────────────
-
-    def _build_documents(self) -> list[Document]:
-        docs = []
-        for hn, desc in self._data.items():
-            content = f"弦号 {hn}\n{desc}"
-            docs.append(Document(
-                page_content=content,
-                metadata={"hull_number": hn, "description": desc},
-            ))
-        return docs
-
-    def _load_or_build_vector_store(self) -> FAISS:
-        persist_dir = Path(self._persist_path)
-        index_file = persist_dir / "index.faiss"
-
-        data_changed = self._data_changed()
-
-        if not self._auto_rebuild and not data_changed and index_file.exists():
-            try:
-                logger.info("从 %s 加载向量库缓存…", persist_dir)
-                vs = FAISS.load_local(
-                    str(persist_dir),
-                    self._get_embeddings(),
-                    allow_dangerous_deserialization=True,
-                )
-                logger.info("向量库缓存加载成功")
-                return vs
-            except Exception as e:
-                logger.warning("缓存加载失败（%s），将重新构建", e)
-
-        # 数据变化时，重新加载
-        if data_changed:
-            self._data = self._source.load_all()
-
-        docs = self._build_documents()
-        logger.info("正在构建 FAISS 向量库（%d 条文档）…", len(docs))
-        vs = FAISS.from_documents(docs, self._get_embeddings())
-
-        persist_dir.mkdir(parents=True, exist_ok=True)
-        vs.save_local(str(persist_dir))
-
-        self._save_hash(self._compute_data_hash())
-        logger.info("向量库已持久化到 %s，哈希已更新", persist_dir)
-
-        return vs
+    # ── Embedding 管理 ──────────────────────────
 
     def _get_embeddings(self) -> Embeddings:
-        """懒初始化 Embedding 客户端（首次调用语义检索时才创建）"""
+        """懒初始化 Embedding 客户端"""
         if self._embeddings is None:
             self._embeddings = DashScopeEmbeddings(
                 model=self._embed_cfg.get("model", "Qwen3-Embedding-0.6B"),
@@ -244,82 +231,146 @@ class ShipDatabase:
             )
         return self._embeddings
 
-    @property
-    def vector_store(self) -> FAISS:
-        if self._vector_store is None or self._data_changed():
-            self._vector_store = self._load_or_build_vector_store()
-        return self._vector_store
+    def build_embeddings(self, force: bool = False) -> int:
+        """为所有船只数据生成 embedding 并存入 SQLite。
+        跳过已有 embedding 的记录（除非 force=True）。
+        返回新生成的 embedding 数量。
+        """
+        self._data = self._source.load_all()
+        if not self._data:
+            logger.info("无数据，跳过 embedding 构建")
+            return 0
+
+        existing = self._embed_store.load_all_embeddings()
+
+        # 找出需要生成 embedding 的记录
+        if force:
+            to_embed = dict(self._data)
+        else:
+            to_embed = {
+                hn: desc for hn, desc in self._data.items()
+                if hn not in existing
+            }
+
+        if not to_embed:
+            logger.info("所有记录已有 embedding，跳过构建")
+            return 0
+
+        logger.info("需要生成 embedding 的记录: %d 条", len(to_embed))
+
+        # 批量生成 embedding
+        texts = [f"弦号 {hn}\n{desc}" for hn, desc in to_embed.items()]
+        embeddings = self._get_embeddings().embed_documents(texts)
+
+        # 存入 SQLite
+        records = dict(zip(to_embed.keys(), embeddings))
+        count = self._embed_store.store_embeddings_bulk(records)
+
+        # 更新缓存
+        self._embedding_cache = None
+
+        logger.info("已生成并存储 %d 条 embedding", count)
+        return count
+
+    def _load_embedding_cache(self) -> dict[str, list[float]]:
+        """加载 embedding 到内存缓存"""
+        if self._embedding_cache is None:
+            self._embedding_cache = self._embed_store.load_all_embeddings()
+        return self._embedding_cache
 
     # ── 精确查找 ──────────────────────────────
 
     def lookup(self, hull_number: str) -> str | None:
         return self._source.lookup(hull_number)
 
-    # ── 语义检索 ──────────────────────────────
+    # ── 语义检索（SQLite embedding + 余弦相似度）──
 
     def semantic_search(self, query: str, top_k: int | None = None) -> list[dict]:
+        """语义检索：用 query 的 embedding 与 SQLite 中存储的 embedding 计算余弦相似度"""
         k = top_k or self._top_k
-        results_with_score = self.vector_store.similarity_search_with_score(query, k=k)
 
+        # 1. 生成 query 的 embedding
+        query_embedding = self._get_embeddings().embed_query(query)
+
+        # 2. 加载所有 embedding
+        all_embeddings = self._load_embedding_cache()
+
+        if not all_embeddings:
+            logger.warning("无 embedding 数据，请先调用 build_embeddings()")
+            return []
+
+        # 3. 计算余弦相似度
+        scored = []
+        for hn, vec in all_embeddings.items():
+            score = _cosine_similarity(query_embedding, vec)
+            scored.append((hn, score))
+
+        # 4. 按相似度降序排序，取 top_k
+        scored.sort(key=lambda x: x[1], reverse=True)
+        top_results = scored[:k]
+
+        # 5. 组装结果
         results = []
-        for doc, distance in results_with_score:
-            score = float(1.0 / (1.0 + distance))
+        for hn, score in top_results:
+            desc = self._data.get(hn) or self._source.lookup(hn) or ""
             results.append({
-                "hull_number": doc.metadata["hull_number"],
-                "description": doc.metadata["description"],
+                "hull_number": hn,
+                "description": desc,
                 "score": round(score, 4),
             })
+
         return results
 
     def semantic_search_filtered(self, query: str) -> list[dict]:
         results = self.semantic_search(query, top_k=self._top_k)
         return [r for r in results if r["score"] >= self._score_threshold]
 
-    # ── CRUD 操作（委托给数据源）─────────────────────
+    # ── CRUD 操作 ──────────────────────────────
 
     def add_ship(self, hull_number: str, description: str) -> bool:
-        """新增船只，成功返回 True"""
         result = self._source.add(hull_number, description)
         if result:
             self._invalidate_cache()
         return result
 
     def update_ship(self, hull_number: str, description: str) -> bool:
-        """更新船只描述，成功返回 True"""
         result = self._source.update(hull_number, description)
         if result:
             self._invalidate_cache()
         return result
 
     def delete_ship(self, hull_number: str) -> bool:
-        """删除船只，成功返回 True"""
         result = self._source.delete(hull_number)
         if result:
+            # 同时删除 embedding
+            if hasattr(self._embed_store, 'delete_embedding'):
+                self._embed_store.delete_embedding(hull_number)
             self._invalidate_cache()
         return result
 
     def upsert_ship(self, hull_number: str, description: str) -> str:
-        """插入或更新船只。返回 'inserted' 或 'updated'。"""
         result = self._source.upsert(hull_number, description)
         self._invalidate_cache()
         return result
 
     def reload(self) -> None:
-        """强制重新加载数据并重建向量库"""
         self._data = self._source.load_all()
-        self._vector_store = None  # 下次访问时重建
+        self._embedding_cache = None
 
     def _invalidate_cache(self) -> None:
-        """数据变更后使缓存失效"""
         self._data = self._source.load_all()
-        self._vector_store = None
+        self._embedding_cache = None
 
     # ── 属性 ──────────────────────────────────
 
     @property
     def source(self):
-        """获取底层数据源实例（供 Web 层使用）"""
         return self._source
+
+    @property
+    def embed_store(self):
+        """获取 embedding 存储后端"""
+        return self._embed_store
 
     @property
     def hull_numbers(self) -> list[str]:
